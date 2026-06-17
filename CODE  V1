@@ -1,0 +1,965 @@
+//+------------------------------------------------------------------+
+//|  CRT Liquidity Sweep EA                                          |
+//|  Strategy : M15 EMA Trend + CRT Candle + Liquidity Sweep +       |
+//|             M1 BOS + FVG Retest + Pending Order                  |
+//|  Symbol   : XAUUSD (Gold)                                        |
+//|  Version  : 1.0                                                  |
+//+------------------------------------------------------------------+
+#property copyright "CRT Liquidity Sweep EA"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\OrderInfo.mqh>
+
+//+------------------------------------------------------------------+
+//| Input Parameters                                                  |
+//+------------------------------------------------------------------+
+
+// --- Trend Filter ---
+input group "=== Trend Filter (M15) ==="
+input int    InpEMA_Fast       = 20;          // EMA Fast Period
+input int    InpEMA_Slow       = 50;          // EMA Slow Period
+
+// --- CRT Candle ---
+input group "=== CRT Candle ==="
+input int    InpCRT_LookBack   = 1;           // Bars back for CRT (1 = previous bar)
+
+// --- Liquidity Sweep ---
+input group "=== Liquidity Sweep ==="
+input double InpSweepMinPts    = 2.0;         // Minimum sweep points (2-5)
+input double InpSweepMaxPts    = 5.0;         // Maximum sweep points
+
+// --- BOS Detection ---
+input group "=== BOS / MSS (M1) ==="
+input int    InpSwingLookBack  = 5;           // Swing High/Low lookback bars (M1)
+
+// --- Pending Order ---
+input group "=== Pending Order ==="
+input double InpOrderOffsetPts = 20.0;        // Points above/below BOS candle
+
+// --- Stop Loss ---
+input group "=== Stop Loss ==="
+input double InpSL_BufferPts   = 25.0;        // Buffer beyond sweep (20-30 pts)
+
+// --- Take Profit ---
+input group "=== Take Profit ==="
+input double InpTP1_R          = 1.0;         // TP1 Risk-Reward ratio
+input double InpTP2_R          = 2.0;         // TP2 Risk-Reward ratio
+input double InpTP1_Pct        = 50.0;        // TP1 close percent
+input double InpTP2_Pct        = 30.0;        // TP2 close percent
+// TP3 = remaining 20% to next liquidity (manual or ATR projection)
+
+// --- Breakeven ---
+input group "=== Breakeven ==="
+input double InpBE_TriggerR    = 1.0;         // Move SL to entry when profit >= NR
+
+// --- Trailing Stop ---
+input group "=== Trailing Stop ==="
+input double InpTrail_StartR   = 1.5;         // Start trailing at NR
+input double InpTrail_DistR    = 0.5;         // Trail distance in R
+
+// --- Risk Management ---
+input group "=== Risk Management ==="
+input double InpRiskPct        = 1.0;         // Risk per trade (%)
+input int    InpMagic          = 202401;       // Magic Number
+input int    InpMaxPositions   = 1;           // Max concurrent trades
+
+// --- News Filter ---
+input group "=== News Filter ==="
+input bool   InpNewsFilter     = true;        // Enable News Filter
+input int    InpNewsMinsBefore = 30;          // Minutes before news
+input int    InpNewsMinsAfter  = 30;          // Minutes after news
+
+// --- Spread Filter ---
+input group "=== Spread Filter ==="
+input double InpMaxSpreadPts   = 300.0;       // Max spread in points
+
+// --- Session Filter ---
+input group "=== Session Filter ==="
+input bool   InpSessionFilter  = true;        // Enable Session Filter
+input int    InpLondonStart    = 13;          // London Open hour (server)
+input int    InpLondonEnd      = 18;          // London Close hour
+input int    InpNYStart        = 19;          // NY Open hour (server)
+input int    InpNYEnd          = 24;          // NY Close hour (0 = midnight)
+
+// --- Dashboard ---
+input group "=== Dashboard ==="
+input bool   InpShowDashboard  = true;        // Show dashboard on chart
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+CTrade        trade;
+CPositionInfo posInfo;
+COrderInfo    orderInfo;
+
+// Indicator handles
+int hEMA_Fast_M15 = INVALID_HANDLE;
+int hEMA_Slow_M15 = INVALID_HANDLE;
+
+// Point multiplier (for 5-digit brokers)
+double PointMult = 1.0;
+
+// State machine
+enum ENUM_SIGNAL_STATE
+{
+   STATE_IDLE,           // Waiting for setup
+   STATE_SWEEP_FOUND,    // Liquidity sweep confirmed
+   STATE_BOS_FOUND,      // BOS confirmed on M1
+   STATE_RETEST_WAIT,    // Waiting for retest
+   STATE_ORDER_PLACED    // Pending order active
+};
+
+ENUM_SIGNAL_STATE g_State     = STATE_IDLE;
+ENUM_ORDER_TYPE   g_OrderType = ORDER_TYPE_BUY_STOP;  // pending order direction
+
+// CRT values
+double g_CRT_High = 0;
+double g_CRT_Low  = 0;
+double g_CRT_Mid  = 0;
+
+// Sweep values
+double g_SweepPrice  = 0;
+bool   g_BuySetup    = false;  // true=buy, false=sell
+
+// BOS values
+double g_BOS_Price   = 0;
+double g_BOS_High    = 0;
+double g_BOS_Low     = 0;
+
+// SL / Risk
+double g_SL_Price    = 0;
+double g_SL_Dist     = 0;   // distance in price
+double g_Entry_Price = 0;
+
+// BE / Trail tracking per ticket
+struct TradeRecord
+{
+   ulong  ticket;
+   double entryPrice;
+   double slDist;       // original SL distance
+   bool   tp1Hit;
+   bool   tp2Hit;
+   bool   beSet;
+   bool   trailActive;
+   double lotTP1;
+   double lotTP2;
+};
+
+TradeRecord g_Trades[];
+int         g_TradeCount = 0;
+
+// News event times (simple manual list — extend as needed)
+// In production, connect to Forex Factory calendar API
+datetime g_NewsTimes[];
+int      g_NewsCount = 0;
+
+// Dashboard labels
+string g_PrefixDash = "CRT_EA_";
+
+//+------------------------------------------------------------------+
+//| Expert Initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Point multiplier
+   if(_Digits == 5 || _Digits == 3)
+      PointMult = 10.0;
+   else
+      PointMult = 1.0;
+
+   // EMA handles on M15
+   hEMA_Fast_M15 = iMA(_Symbol, PERIOD_M15, InpEMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA_Slow_M15 = iMA(_Symbol, PERIOD_M15, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(hEMA_Fast_M15 == INVALID_HANDLE || hEMA_Slow_M15 == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create EMA indicators.");
+      return INIT_FAILED;
+   }
+
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(30);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   ArrayResize(g_Trades, 0);
+   g_TradeCount = 0;
+
+   if(InpShowDashboard)
+      CreateDashboard();
+
+   Print("CRT Liquidity Sweep EA initialized. Symbol=", _Symbol,
+         " Digits=", _Digits, " PointMult=", PointMult);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert Deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(hEMA_Fast_M15);
+   IndicatorRelease(hEMA_Slow_M15);
+   DeleteDashboard();
+   Print("CRT EA deinitialized. Reason=", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert Tick                                                       |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // --- Pre-checks ---
+   if(!IsNewBar(PERIOD_M1)) // Run logic on every M1 bar open
+   {
+      // Still manage open trades on every tick
+      ManageOpenTrades();
+      if(InpShowDashboard) UpdateDashboard();
+      return;
+   }
+
+   // Run full pipeline on new M1 bar
+   ManageOpenTrades();
+
+   // --- Global filters ---
+   if(!PassFilters()) return;
+
+   // --- Count open positions ---
+   if(CountPositions() >= InpMaxPositions) return;
+
+   // --- State machine ---
+   switch(g_State)
+   {
+      case STATE_IDLE:
+         RunIdleState();
+         break;
+
+      case STATE_SWEEP_FOUND:
+         RunBOSCheck();
+         break;
+
+      case STATE_BOS_FOUND:
+         RunRetestCheck();
+         break;
+
+      case STATE_RETEST_WAIT:
+         RunPlaceOrder();
+         break;
+
+      case STATE_ORDER_PLACED:
+         CheckOrderFilled();
+         break;
+   }
+
+   if(InpShowDashboard) UpdateDashboard();
+}
+
+//+------------------------------------------------------------------+
+//| STATE: IDLE — Check Trend + CRT + Sweep in one pass              |
+//+------------------------------------------------------------------+
+void RunIdleState()
+{
+   // Step 1: Trend Filter on M15
+   bool buyTrend, sellTrend;
+   if(!GetTrendFilter(buyTrend, sellTrend)) return;
+   if(!buyTrend && !sellTrend) return;
+
+   // Step 2: CRT Candle
+   if(!GetCRTCandle()) return;
+
+   // Step 3: Liquidity Sweep
+   if(buyTrend && CheckBuySweep())
+   {
+      g_BuySetup = true;
+      g_State    = STATE_SWEEP_FOUND;
+      Print("BUY Sweep confirmed. CRT_Low=", g_CRT_Low,
+            " Sweep=", g_SweepPrice);
+      return;
+   }
+
+   if(sellTrend && CheckSellSweep())
+   {
+      g_BuySetup = false;
+      g_State    = STATE_SWEEP_FOUND;
+      Print("SELL Sweep confirmed. CRT_High=", g_CRT_High,
+            " Sweep=", g_SweepPrice);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| STATE: SWEEP_FOUND — Wait for M1 BOS                             |
+//+------------------------------------------------------------------+
+void RunBOSCheck()
+{
+   if(CheckBOS())
+   {
+      g_State = STATE_BOS_FOUND;
+      Print("BOS confirmed. BOS_Price=", g_BOS_Price,
+            " Direction=", (g_BuySetup ? "BUY" : "SELL"));
+   }
+   else
+   {
+      // Timeout: if price closes back through CRT midpoint, reset
+      double closeM1 = iClose(_Symbol, PERIOD_M1, 1);
+      if(g_BuySetup  && closeM1 < g_CRT_Mid) { ResetState(); }
+      if(!g_BuySetup && closeM1 > g_CRT_Mid) { ResetState(); }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| STATE: BOS_FOUND — Check Retest of zone                          |
+//+------------------------------------------------------------------+
+void RunRetestCheck()
+{
+   if(CheckRetest())
+   {
+      g_State = STATE_RETEST_WAIT;
+      Print("Retest confirmed near BOS zone. Placing pending order...");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| STATE: RETEST_WAIT — Place pending order                         |
+//+------------------------------------------------------------------+
+void RunPlaceOrder()
+{
+   // Calculate Entry, SL, Lot
+   double entry = 0, sl = 0;
+   double offset = InpOrderOffsetPts * _Point * PointMult;
+
+   if(g_BuySetup)
+   {
+      entry      = g_BOS_High + offset;
+      sl         = g_SweepPrice - InpSL_BufferPts * _Point * PointMult;
+      g_OrderType = ORDER_TYPE_BUY_STOP;
+   }
+   else
+   {
+      entry      = g_BOS_Low - offset;
+      sl         = g_SweepPrice + InpSL_BufferPts * _Point * PointMult;
+      g_OrderType = ORDER_TYPE_SELL_STOP;
+   }
+
+   double slDist = MathAbs(entry - sl);
+   if(slDist <= 0)
+   {
+      Print("Invalid SL distance. Resetting.");
+      ResetState();
+      return;
+   }
+
+   double tp1 = (g_BuySetup) ? entry + slDist * InpTP1_R : entry - slDist * InpTP1_R;
+   double lot  = CalcLotSize(slDist);
+
+   if(lot <= 0)
+   {
+      Print("Lot calculation failed. Resetting.");
+      ResetState();
+      return;
+   }
+
+   // Normalize prices
+   entry = NormalizeDouble(entry, _Digits);
+   sl    = NormalizeDouble(sl,    _Digits);
+   tp1   = NormalizeDouble(tp1,   _Digits);
+   lot   = NormalizeDouble(lot, 2);
+
+   bool placed = false;
+   if(g_BuySetup)
+      placed = trade.BuyStop(lot, entry, sl, tp1, "CRT_BS");
+   else
+      placed = trade.SellStop(lot, entry, sl, tp1, "CRT_SS");
+
+   if(placed)
+   {
+      g_Entry_Price = entry;
+      g_SL_Price    = sl;
+      g_SL_Dist     = slDist;
+      g_State       = STATE_ORDER_PLACED;
+      Print("Pending order placed. Type=", (g_BuySetup ? "BuyStop" : "SellStop"),
+            " Entry=", entry, " SL=", sl, " TP1=", tp1, " Lot=", lot);
+   }
+   else
+   {
+      Print("Order placement failed: ", trade.ResultRetcodeDescription());
+      ResetState();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| STATE: ORDER_PLACED — Watch for fill                              |
+//+------------------------------------------------------------------+
+void CheckOrderFilled()
+{
+   // Check if our pending order was filled (position now open)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(posInfo.SelectByIndex(i))
+      {
+         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol)
+         {
+            ulong ticket = posInfo.Ticket();
+            if(!IsTracked(ticket))
+            {
+               AddTradeRecord(ticket, posInfo.PriceOpen(), g_SL_Dist,
+                              posInfo.Volume());
+               Print("Position filled and tracked. Ticket=", ticket);
+               ResetState();
+               return;
+            }
+         }
+      }
+   }
+
+   // Check if pending order was cancelled/expired
+   bool pendingExists = false;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(orderInfo.SelectByIndex(i))
+         if(orderInfo.Magic() == InpMagic) { pendingExists = true; break; }
+   }
+   if(!pendingExists)
+   {
+      Print("Pending order no longer exists. Resetting state.");
+      ResetState();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions: TP2/TP3 partial, BE, Trailing             |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+{
+   for(int i = 0; i < g_TradeCount; i++)
+   {
+      TradeRecord &rec = g_Trades[i];
+      if(!posInfo.SelectByTicket(rec.ticket)) continue;
+
+      double curPrice  = (posInfo.PositionType() == POSITION_TYPE_BUY)
+                         ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                         : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double openPrice = posInfo.PriceOpen();
+      double curSL     = posInfo.StopLoss();
+      double slDist    = rec.slDist;
+
+      bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
+      double profit_R  = isBuy
+                         ? (curPrice - openPrice) / slDist
+                         : (openPrice - curPrice) / slDist;
+
+      // --- TP2 Partial Close (30% at 2R) ---
+      if(!rec.tp2Hit && profit_R >= InpTP2_R)
+      {
+         double closeVol = NormalizeDouble(posInfo.Volume() * InpTP2_Pct / 100.0, 2);
+         if(closeVol >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+         {
+            if(trade.PositionClosePartial(rec.ticket, closeVol))
+            {
+               rec.tp2Hit = true;
+               Print("TP2 partial close. Ticket=", rec.ticket,
+                     " Vol=", closeVol, " R=", profit_R);
+            }
+         }
+      }
+
+      // --- TP1 Partial Close (50% at 1R) — executed before TP2 check ---
+      if(!rec.tp1Hit && profit_R >= InpTP1_R)
+      {
+         double closeVol = NormalizeDouble(posInfo.Volume() * InpTP1_Pct / 100.0, 2);
+         if(closeVol >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+         {
+            if(trade.PositionClosePartial(rec.ticket, closeVol))
+            {
+               rec.tp1Hit = true;
+               Print("TP1 partial close. Ticket=", rec.ticket,
+                     " Vol=", closeVol, " R=", profit_R);
+            }
+         }
+      }
+
+      // --- Breakeven ---
+      if(!rec.beSet && profit_R >= InpBE_TriggerR)
+      {
+         double newSL = NormalizeDouble(openPrice, _Digits);
+         if(isBuy  && newSL > curSL) SetSL(rec.ticket, newSL);
+         if(!isBuy && (curSL == 0 || newSL < curSL)) SetSL(rec.ticket, newSL);
+         rec.beSet = true;
+         Print("Breakeven set. Ticket=", rec.ticket, " SL→", newSL);
+      }
+
+      // --- Trailing Stop ---
+      if(profit_R >= InpTrail_StartR)
+      {
+         rec.trailActive = true;
+         double trailDist = slDist * InpTrail_DistR;
+         double trailSL   = isBuy
+                            ? NormalizeDouble(curPrice - trailDist, _Digits)
+                            : NormalizeDouble(curPrice + trailDist, _Digits);
+
+         bool shouldUpdate = isBuy  ? (trailSL > curSL)
+                                    : (curSL == 0 || trailSL < curSL);
+         if(shouldUpdate)
+         {
+            SetSL(rec.ticket, trailSL);
+         }
+      }
+   }
+
+   // Clean closed trades from array
+   CleanClosedTrades();
+}
+
+//+------------------------------------------------------------------+
+//| Trend Filter — M15 EMA20 vs EMA50                                |
+//+------------------------------------------------------------------+
+bool GetTrendFilter(bool &buyTrend, bool &sellTrend)
+{
+   double emaFast[], emaSlow[];
+   ArraySetAsSeries(emaFast, true);
+   ArraySetAsSeries(emaSlow, true);
+
+   if(CopyBuffer(hEMA_Fast_M15, 0, 0, 3, emaFast) < 3) return false;
+   if(CopyBuffer(hEMA_Slow_M15, 0, 0, 3, emaSlow) < 3) return false;
+
+   double closeM15[];
+   ArraySetAsSeries(closeM15, true);
+   if(CopyClose(_Symbol, PERIOD_M15, 0, 3, closeM15) < 3) return false;
+
+   // Buy: EMA20 > EMA50 AND close above EMA20
+   buyTrend  = (emaFast[1] > emaSlow[1]) && (closeM15[1] > emaFast[1]);
+   // Sell: EMA20 < EMA50 AND close below EMA20
+   sellTrend = (emaFast[1] < emaSlow[1]) && (closeM15[1] < emaFast[1]);
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CRT Candle — previous M15 bar                                    |
+//+------------------------------------------------------------------+
+bool GetCRTCandle()
+{
+   int bar = InpCRT_LookBack;  // 1 = most recently closed M15 bar
+   double h[], l[];
+   ArraySetAsSeries(h, true);
+   ArraySetAsSeries(l, true);
+
+   if(CopyHigh(_Symbol, PERIOD_M15, bar, 1, h) < 1) return false;
+   if(CopyLow (_Symbol, PERIOD_M15, bar, 1, l) < 1) return false;
+
+   g_CRT_High = h[0];
+   g_CRT_Low  = l[0];
+   g_CRT_Mid  = (g_CRT_High + g_CRT_Low) / 2.0;
+
+   return (g_CRT_High > g_CRT_Low);
+}
+
+//+------------------------------------------------------------------+
+//| Liquidity Sweep — Buy Setup (price swept below CRT_Low)          |
+//+------------------------------------------------------------------+
+bool CheckBuySweep()
+{
+   double lo[], cl[];
+   ArraySetAsSeries(lo, true);
+   ArraySetAsSeries(cl, true);
+   if(CopyLow  (_Symbol, PERIOD_M1, 1, 3, lo) < 3) return false;
+   if(CopyClose(_Symbol, PERIOD_M1, 1, 3, cl) < 3) return false;
+
+   double minSweep = InpSweepMinPts * _Point * PointMult;
+   double maxSweep = InpSweepMaxPts * _Point * PointMult;
+
+   for(int i = 0; i < 3; i++)
+   {
+      double sweepDepth = g_CRT_Low - lo[i];
+      if(sweepDepth >= minSweep && sweepDepth <= maxSweep && cl[i] > g_CRT_Low)
+      {
+         g_SweepPrice = lo[i];
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Liquidity Sweep — Sell Setup (price swept above CRT_High)        |
+//+------------------------------------------------------------------+
+bool CheckSellSweep()
+{
+   double hi[], cl[];
+   ArraySetAsSeries(hi, true);
+   ArraySetAsSeries(cl, true);
+   if(CopyHigh (_Symbol, PERIOD_M1, 1, 3, hi) < 3) return false;
+   if(CopyClose(_Symbol, PERIOD_M1, 1, 3, cl) < 3) return false;
+
+   double minSweep = InpSweepMinPts * _Point * PointMult;
+   double maxSweep = InpSweepMaxPts * _Point * PointMult;
+
+   for(int i = 0; i < 3; i++)
+   {
+      double sweepDepth = hi[i] - g_CRT_High;
+      if(sweepDepth >= minSweep && sweepDepth <= maxSweep && cl[i] < g_CRT_High)
+      {
+         g_SweepPrice = hi[i];
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| BOS Check on M1                                                   |
+//+------------------------------------------------------------------+
+bool CheckBOS()
+{
+   int lb = InpSwingLookBack;
+   double hi[], lo[], cl[];
+   ArraySetAsSeries(hi, true);
+   ArraySetAsSeries(lo, true);
+   ArraySetAsSeries(cl, true);
+
+   int bars = lb + 5;
+   if(CopyHigh (_Symbol, PERIOD_M1, 1, bars, hi) < bars) return false;
+   if(CopyLow  (_Symbol, PERIOD_M1, 1, bars, lo) < bars) return false;
+   if(CopyClose(_Symbol, PERIOD_M1, 1, bars, cl) < bars) return false;
+
+   if(g_BuySetup)
+   {
+      // Find recent swing high (last lb bars)
+      double swingHigh = 0;
+      for(int i = 1; i < lb + 1; i++)
+         if(hi[i] > swingHigh) swingHigh = hi[i];
+
+      // BOS = current close breaks above swing high
+      if(cl[0] > swingHigh && swingHigh > 0)
+      {
+         g_BOS_Price = swingHigh;
+         g_BOS_High  = hi[0];
+         g_BOS_Low   = lo[0];
+         return true;
+      }
+   }
+   else
+   {
+      // Find recent swing low
+      double swingLow = DBL_MAX;
+      for(int i = 1; i < lb + 1; i++)
+         if(lo[i] < swingLow) swingLow = lo[i];
+
+      // BOS = current close breaks below swing low
+      if(cl[0] < swingLow && swingLow < DBL_MAX)
+      {
+         g_BOS_Price = swingLow;
+         g_BOS_High  = hi[0];
+         g_BOS_Low   = lo[0];
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Retest Check — price returns to BOS zone / FVG area              |
+//| Simple approach: price re-enters the BOS candle's body           |
+//+------------------------------------------------------------------+
+bool CheckRetest()
+{
+   double hi[], lo[], cl[];
+   ArraySetAsSeries(hi, true);
+   ArraySetAsSeries(lo, true);
+   ArraySetAsSeries(cl, true);
+   if(CopyHigh (_Symbol, PERIOD_M1, 1, 3, hi) < 3) return false;
+   if(CopyLow  (_Symbol, PERIOD_M1, 1, 3, lo) < 3) return false;
+   if(CopyClose(_Symbol, PERIOD_M1, 1, 3, cl) < 3) return false;
+
+   // BOS zone = between BOS_Low and BOS_High
+   double zoneTop    = g_BOS_High;
+   double zoneBottom = g_BOS_Low;
+
+   for(int i = 0; i < 3; i++)
+   {
+      if(g_BuySetup)
+      {
+         // Price dips back into BOS zone from above
+         if(lo[i] <= zoneTop && lo[i] >= zoneBottom && cl[i] > zoneBottom)
+            return true;
+      }
+      else
+      {
+         // Price rallies back into BOS zone from below
+         if(hi[i] >= zoneBottom && hi[i] <= zoneTop && cl[i] < zoneTop)
+            return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Global Filters                                                    |
+//+------------------------------------------------------------------+
+bool PassFilters()
+{
+   // Spread filter
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point;
+   double maxSp  = InpMaxSpreadPts * _Point * PointMult;
+   if(spread > maxSp)
+   {
+      // Comment("CRT EA: Spread too high (" + DoubleToString(spread/_Point, 0) + " pts)");
+      return false;
+   }
+
+   // Session filter
+   if(InpSessionFilter && !IsInSession())
+      return false;
+
+   // News filter
+   if(InpNewsFilter && IsNearNews())
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Session Check                                                     |
+//+------------------------------------------------------------------+
+bool IsInSession()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+
+   bool london = (h >= InpLondonStart && h < InpLondonEnd);
+   bool ny     = (h >= InpNYStart || (InpNYEnd == 24 ? false : h < InpNYEnd));
+   if(InpNYEnd == 24) ny = (h >= InpNYStart);
+
+   return (london || ny);
+}
+
+//+------------------------------------------------------------------+
+//| News Filter — checks within X minutes of known news times        |
+//+------------------------------------------------------------------+
+bool IsNearNews()
+{
+   if(g_NewsCount == 0) return false;
+   datetime now = TimeCurrent();
+   int bufBefore = InpNewsMinsBefore * 60;
+   int bufAfter  = InpNewsMinsAfter  * 60;
+
+   for(int i = 0; i < g_NewsCount; i++)
+   {
+      if(now >= g_NewsTimes[i] - bufBefore &&
+         now <= g_NewsTimes[i] + bufAfter)
+         return true;
+   }
+   return false;
+}
+
+// Call this from your own news event loader or EventSetTimer callback
+void AddNewsEvent(datetime t)
+{
+   g_NewsCount++;
+   ArrayResize(g_NewsTimes, g_NewsCount);
+   g_NewsTimes[g_NewsCount - 1] = t;
+}
+
+//+------------------------------------------------------------------+
+//| Lot Size Calculation                                              |
+//+------------------------------------------------------------------+
+double CalcLotSize(double slDist)
+{
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney  = balance * InpRiskPct / 100.0;
+   double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double minLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot     = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(tickValue == 0 || tickSize == 0 || slDist == 0) return 0;
+
+   double slTicks = slDist / tickSize;
+   double lot     = riskMoney / (slTicks * tickValue);
+
+   // Round to lot step
+   lot = MathFloor(lot / stepLot) * stepLot;
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+
+   return lot;
+}
+
+//+------------------------------------------------------------------+
+//| Helpers                                                           |
+//+------------------------------------------------------------------+
+int CountPositions()
+{
+   int cnt = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+      if(posInfo.SelectByIndex(i))
+         if(posInfo.Magic() == InpMagic && posInfo.Symbol() == _Symbol)
+            cnt++;
+   return cnt;
+}
+
+bool IsNewBar(ENUM_TIMEFRAMES tf)
+{
+   static datetime lastBar = 0;
+   datetime curBar = iTime(_Symbol, tf, 0);
+   if(curBar != lastBar) { lastBar = curBar; return true; }
+   return false;
+}
+
+void SetSL(ulong ticket, double newSL)
+{
+   if(!posInfo.SelectByTicket(ticket)) return;
+   double tp = posInfo.TakeProfit();
+   trade.PositionModify(ticket, NormalizeDouble(newSL, _Digits), tp);
+}
+
+void ResetState()
+{
+   g_State      = STATE_IDLE;
+   g_CRT_High   = 0;
+   g_CRT_Low    = 0;
+   g_CRT_Mid    = 0;
+   g_SweepPrice = 0;
+   g_BOS_Price  = 0;
+   g_BOS_High   = 0;
+   g_BOS_Low    = 0;
+   g_SL_Price   = 0;
+   g_SL_Dist    = 0;
+}
+
+bool IsTracked(ulong ticket)
+{
+   for(int i = 0; i < g_TradeCount; i++)
+      if(g_Trades[i].ticket == ticket) return true;
+   return false;
+}
+
+void AddTradeRecord(ulong ticket, double entry, double slDist, double totalLot)
+{
+   g_TradeCount++;
+   ArrayResize(g_Trades, g_TradeCount);
+   int idx               = g_TradeCount - 1;
+   g_Trades[idx].ticket      = ticket;
+   g_Trades[idx].entryPrice  = entry;
+   g_Trades[idx].slDist      = slDist;
+   g_Trades[idx].tp1Hit      = false;
+   g_Trades[idx].tp2Hit      = false;
+   g_Trades[idx].beSet       = false;
+   g_Trades[idx].trailActive = false;
+   g_Trades[idx].lotTP1      = NormalizeDouble(totalLot * InpTP1_Pct / 100.0, 2);
+   g_Trades[idx].lotTP2      = NormalizeDouble(totalLot * InpTP2_Pct / 100.0, 2);
+}
+
+void CleanClosedTrades()
+{
+   for(int i = g_TradeCount - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByTicket(g_Trades[i].ticket))
+      {
+         for(int j = i; j < g_TradeCount - 1; j++)
+            g_Trades[j] = g_Trades[j + 1];
+         g_TradeCount--;
+         ArrayResize(g_Trades, g_TradeCount);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Dashboard                                                         |
+//+------------------------------------------------------------------+
+string StateStr()
+{
+   switch(g_State)
+   {
+      case STATE_IDLE:         return "IDLE - รอ Setup";
+      case STATE_SWEEP_FOUND:  return "Sweep พบแล้ว - รอ BOS";
+      case STATE_BOS_FOUND:    return "BOS พบแล้ว - รอ Retest";
+      case STATE_RETEST_WAIT:  return "Retest OK - วาง Order";
+      case STATE_ORDER_PLACED: return "Order รอ Fill";
+      default:                 return "UNKNOWN";
+   }
+}
+
+void CreateLabel(string name, string text, int x, int y,
+                 color clr, int fontSize = 9)
+{
+   string fullName = g_PrefixDash + name;
+   if(ObjectFind(0, fullName) < 0)
+      ObjectCreate(0, fullName, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, fullName, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, fullName, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, fullName, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, fullName, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, fullName, OBJPROP_FONTSIZE,  fontSize);
+   ObjectSetString (0, fullName, OBJPROP_FONT,      "Arial Bold");
+   ObjectSetString (0, fullName, OBJPROP_TEXT,      text);
+}
+
+void CreateDashboard()
+{
+   // Background rectangle
+   string bg = g_PrefixDash + "BG";
+   if(ObjectFind(0, bg) < 0)
+      ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE,  10);
+   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE,  10);
+   ObjectSetInteger(0, bg, OBJPROP_XSIZE,      280);
+   ObjectSetInteger(0, bg, OBJPROP_YSIZE,      200);
+   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR,    C'25,25,35');
+   ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, bg, OBJPROP_COLOR,      C'60,100,180');
+   ObjectSetInteger(0, bg, OBJPROP_WIDTH,      1);
+   ObjectSetInteger(0, bg, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, bg, OBJPROP_BACK,       true);
+}
+
+void UpdateDashboard()
+{
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * _Point / (_Point * PointMult);
+
+   CreateLabel("Title",   "▶ CRT Liquidity Sweep EA",                 20, 20,  C'100,180,255', 10);
+   CreateLabel("Symbol",  "Symbol : " + _Symbol,                      20, 40,  clrSilver);
+   CreateLabel("State",   "State  : " + StateStr(),                   20, 58,  clrYellow);
+   CreateLabel("Dir",     "Setup  : " + (g_BuySetup ? "BUY ▲" : "SELL ▼"), 20, 76,
+               g_BuySetup ? clrLime : clrTomato);
+   CreateLabel("CRT_H",   "CRT Hi : " + DoubleToString(g_CRT_High, _Digits), 20, 94,  clrSilver);
+   CreateLabel("CRT_L",   "CRT Lo : " + DoubleToString(g_CRT_Low,  _Digits), 20, 112, clrSilver);
+   CreateLabel("Sweep",   "Sweep  : " + DoubleToString(g_SweepPrice,_Digits), 20, 130, clrOrange);
+   CreateLabel("BOS",     "BOS    : " + DoubleToString(g_BOS_Price, _Digits), 20, 148, clrAqua);
+   CreateLabel("Spread",  "Spread : " + DoubleToString(spread, 0) + " pts",   20, 166,
+               spread > InpMaxSpreadPts ? clrRed : clrLimeGreen);
+   CreateLabel("Session", "Session: " + (IsInSession() ? "OPEN ✓" : "CLOSED ✗"),
+               20, 184, IsInSession() ? clrLimeGreen : clrGray);
+
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   ObjectsDeleteAll(0, g_PrefixDash);
+}
+
+//+------------------------------------------------------------------+
+//| OnTradeTransaction — handle order events                         |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest     &request,
+                        const MqlTradeResult      &result)
+{
+   // Auto-clean pending orders that were not filled (expired/cancelled)
+   if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+   {
+      if(g_State == STATE_ORDER_PLACED)
+      {
+         Print("Pending order deleted externally. Resetting state.");
+         ResetState();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| End of CRT_LiquiditySweep_EA.mq5                                 |
+//+------------------------------------------------------------------+
